@@ -56,7 +56,8 @@ from transformers.data.metrics.squad_metrics import (
     compute_predictions_logits,
     squad_evaluate,
 )
-from transformers.data.processors.squad import SquadResult, SquadV1Processor, SquadV2Processor
+from transformers.data.processors.squad_classwise import SquadResult, SquadV1Processor, SquadV2Processor,\
+    squad_convert_examples_to_features
 
 
 try:
@@ -197,40 +198,56 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                 steps_trained_in_current_epoch -= 1
                 continue
 
-            #####################
-            import pdb;
-            pdb.set_trace()
-            #####################
-
             model.train()
             if teacher is not None:
                 teacher.eval()
-            batch = tuple(t.to(args.device) for t in batch)
 
-            inputs = {
-                "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "start_positions": batch[3],
-                "end_positions": batch[4],
+            # split the batch for the teacher and the student model using the second dim of the tensors
+            # of shape [num_examples, num_parallel_examples, max_seq_len]
+            if all(b.shape[1]==2 for b in batch):
+                batch_teacher = [b[:, 0] for b in batch]
+                batch_student = [b[:, 1] for b in batch]
+
+            # Squeeze the extra "num_parallel_examples" dimension and
+            # go back to the standard case with one input
+            else:
+                batch_teacher = batch_student = [b.squeeze() for b in batch]
+
+            batch_teacher = tuple(t.to(args.device) for t in batch_teacher)
+            batch_student = tuple(t.to(args.device) for t in batch_student)
+
+            inputs_teacher = {
+                "input_ids": batch_teacher[0],
+                "attention_mask": batch_teacher[1],
+                "start_positions": batch_teacher[3],
+                "end_positions": batch_teacher[4],
             }
+
+            inputs_student = {
+                "input_ids": batch_student[0],
+                "attention_mask": batch_student[1],
+                "start_positions": batch_student[3],
+                "end_positions": batch_student[4],
+            }
+
             if args.model_type != "distilbert":
-                inputs["token_type_ids"] = None if args.model_type == "xlm" else batch[2]
+                inputs_student["token_type_ids"] = None if args.model_type == "xlm" else batch_student[2]
             if args.model_type in ["xlnet", "xlm"]:
-                inputs.update({"cls_index": batch[5], "p_mask": batch[6]})
+                inputs_student.update({"cls_index": batch[5], "p_mask": batch_student[6]})
                 if args.version_2_with_negative:
-                    inputs.update({"is_impossible": batch[7]})
-            outputs = model(**inputs)
+                    inputs_student.update({"is_impossible": batch_student[7]})
+            outputs = model(**inputs_student)
             loss, start_logits_stu, end_logits_stu = outputs
 
             # Distillation loss
             if teacher is not None:
-                if "token_type_ids" not in inputs:
-                    inputs["token_type_ids"] = None if args.teacher_type == "xlm" else batch[2]
+                if "token_type_ids" not in inputs_teacher:
+                    inputs_teacher["token_type_ids"] = None if args.teacher_type == "xlm" else batch_teacher[2]
                 with torch.no_grad():
                     start_logits_tea, end_logits_tea = teacher(
-                        input_ids=inputs["input_ids"],
-                        token_type_ids=inputs["token_type_ids"],
-                        attention_mask=inputs["attention_mask"],
+                        input_ids=inputs_teacher["input_ids"],
+                        token_type_ids=inputs_teacher["token_type_ids"],
+                        attention_mask=inputs_teacher["attention_mask"],
                     )
                 assert start_logits_tea.size() == start_logits_stu.size()
                 assert end_logits_tea.size() == end_logits_stu.size()
@@ -468,7 +485,8 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         if evaluate:
             examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file)
         else:
-            examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
+            use_parallel_examples = True
+            examples = processor.get_train_examples(args.data_dir, use_parallel_examples, filename=args.train_file)
 
         features, dataset = squad_convert_examples_to_features(
             examples=examples,
